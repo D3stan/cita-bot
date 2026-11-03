@@ -1,3 +1,4 @@
+import logging
 import os
 from shutil import which
 
@@ -29,8 +30,13 @@ class wSaySpeaker:
         os.system('wsay "' + phrase + '"')
 
 
+class logSpeaker:
+    def say(self, phrase):
+        logging.warning(phrase)
+
+
 def new_speaker():
     for cls in [eSpeakSpeaker, saySpeaker, wSaySpeaker]:
         if cls.is_applicable():
             return cls()
-    raise ValueError("Please download wsay (Windows) or espeak (Linux). See README for more info")
+    return logSpeaker()
