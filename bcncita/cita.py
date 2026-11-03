@@ -26,6 +26,7 @@ from selenium.webdriver.support import expected_conditions as EC
 from selenium.webdriver.support.ui import Select
 from selenium.webdriver.support.wait import WebDriverWait
 
+from .notify import notify
 from .speaker import new_speaker
 
 __all__ = [
@@ -187,7 +188,11 @@ class CustomerProfile:
     wait_exact_time: Optional[list] = None  # [[minute, second]]
     reason_or_type: str = "solicitud de asilo"
 
+    heartbeat_cycles: int = 0  # post a status line to Discord every N attempts (0 = never)
+
     # Internals
+    attempts: int = 0
+    errors: int = 0
     bot_result: bool = False
     first_load: Optional[bool] = True  # Wait more on the first load to cache stuff
     log_settings: Optional[dict] = field(default_factory=lambda: {"stream": sys.stdout})
@@ -207,8 +212,6 @@ def init_wedriver(context: CustomerProfile):
         options.add_argument(f"user-data-dir={context.chrome_profile_path}")
     if context.chrome_profile_name:
         options.add_argument(f"profile-directory={context.chrome_profile_name}")
-
-    ua = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/102.0.5005.63 Safari/537.36"
 
     options.add_experimental_option("excludeSwitches", ["enable-automation", "enable-logging"])
     options.add_experimental_option("useAutomationExtension", False)
@@ -234,6 +237,11 @@ def init_wedriver(context: CustomerProfile):
 
     browser = webdriver.Chrome(context.chrome_driver_path, options=options)
     browser.execute_script("Object.defineProperty(navigator, 'webdriver', {get: () => undefined})")
+    # Claim the real browser version: a stale/mismatched UA is a bot tell (and headless adds "HeadlessChrome")
+    ua = (
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) "
+        f"Chrome/{browser.capabilities['browserVersion']} Safari/537.36"
+    )
     browser.execute_cdp_cmd("Network.setUserAgentOverride", {"userAgent": ua})
 
     return browser
@@ -241,7 +249,7 @@ def init_wedriver(context: CustomerProfile):
 
 def try_cita(context: CustomerProfile, cycles: int = CYCLES):
     driver = init_wedriver(context)
-    start_with(driver, context, cycles)
+    return start_with(driver, context, cycles)
 
 
 def start_with(driver: webdriver, context: CustomerProfile, cycles: int = CYCLES):
@@ -283,28 +291,54 @@ def start_with(driver: webdriver, context: CustomerProfile, cycles: int = CYCLES
     )
 
     success = False
-    result = False
     for i in range(cycles):
+        context.attempts += 1
+        started = time.monotonic()
+        result = None
         try:
             logging.info(f"\033[33m[Attempt {i + 1}/{cycles}]\033[0m")
             result = cycle_cita(driver, context, fast_forward_url, fast_forward_url2)
         except KeyboardInterrupt:
             raise
         except TimeoutException:
+            context.errors += 1
             logging.error("Timeout exception")
         except Exception as e:
+            context.errors += 1
             logging.error(f"SMTH BROKEN: {e}")
-            continue
+            if not browser_alive(driver):
+                notify("Browser died, restarting the session", urgent=True)
+                break
 
+        logging.info(
+            f"Attempt {i + 1}/{cycles} {'booked' if result else 'no luck'} in "
+            f"{time.monotonic() - started:.0f}s (total attempts {context.attempts}, "
+            f"errors {context.errors})"
+        )
         if result:
             success = True
             logging.info("WIN")
             break
 
+        if context.heartbeat_cycles and context.attempts % context.heartbeat_cycles == 0:
+            notify(f"Still searching: {context.attempts} attempts, {context.errors} errors")
+
     if not success:
-        logging.error("FAIL")
-        speaker.say("FAIL")
-        driver.quit()
+        logging.error("Session ended without a booking")
+        try:
+            driver.quit()
+        except Exception as e:
+            logging.error(f"driver.quit failed: {e}")
+
+    return success
+
+
+def browser_alive(driver: webdriver):
+    try:
+        driver.window_handles
+        return True
+    except Exception:
+        return False
 
 
 def toma_huellas_step2(driver: webdriver, context: CustomerProfile):
@@ -513,7 +547,9 @@ def process_captcha(driver: webdriver, context: CustomerProfile):
             captcha_result = True
 
         if not captcha_result:
+            logging.error("Captcha was not solved")
             return None
+        logging.info("Captcha solved")
 
     else:
         logging.info(
@@ -680,6 +716,7 @@ def office_selection(driver: webdriver, context: CustomerProfile):
                 logging.error("Timed out waiting for offices to load")
                 return None
 
+            notify("Step 2/6: offices have slots, selecting an office")
             res = select_office(driver, context)
             if res is None:
                 time.sleep(5)
@@ -704,6 +741,7 @@ def phone_mail(driver: webdriver, context: CustomerProfile):
             EC.presence_of_element_located((By.ID, "txtTelefonoCitado"))
         )
         logging.info("[Step 3/6] Contact info")
+        notify("Step 3/6: reached the contact info page")
     except TimeoutException:
         logging.error("Timed out waiting for contact info page to load")
         return None
@@ -741,6 +779,7 @@ def confirm_appointment(driver: webdriver, context: CustomerProfile):
         context.bot_result = True
         code = driver.find_element(By.ID, "justificanteFinal").text
         logging.info(f"[Step 6/6] Justificante cita: {code}")
+        notify(f"CITA BOOKED! Justificante: {code}", driver, urgent=True)
         if context.save_artifacts:
             image_name = f"CONFIRMED-CITA-{ctime}.png".replace(":", "-")
             driver.save_screenshot(image_name)
@@ -753,7 +792,9 @@ def confirm_appointment(driver: webdriver, context: CustomerProfile):
         return True
     elif "Lo sentimos, el código introducido no es correcto" in resp_text:
         logging.error("Incorrect code entered")
+        notify("Incorrect SMS code entered", driver, urgent=True)
     else:
+        notify("Confirmation failed, unexpected page", driver, urgent=True)
         error_name = f"error-{ctime}.png".replace(":", "-")
         driver.save_screenshot(error_name)
 
@@ -761,7 +802,9 @@ def confirm_appointment(driver: webdriver, context: CustomerProfile):
 
 
 def log_backoff(details):
-    logging.error(f"Unable to load the initial page, backing off {details['wait']:0.1f} seconds")
+    msg = f"Unable to load the initial page, backing off {details['wait']:0.1f} seconds"
+    logging.error(msg)
+    notify(msg.split(",")[0])
 
 
 @backoff.on_exception(
@@ -872,6 +915,7 @@ def cita_selection(driver: webdriver, context: CustomerProfile):
 
     if "DISPONE DE 5 MINUTOS" in resp_text:
         logging.info("[Step 4/6] Cita attempt -> selection hit!")
+        notify("Step 4/6: appointment slots on screen!", driver, urgent=True)
         if context.save_artifacts:
             driver.save_screenshot(f"citas-{dt.now()}.png".replace(":", "-"))
 
@@ -897,6 +941,7 @@ def cita_selection(driver: webdriver, context: CustomerProfile):
         driver.switch_to.alert.accept()
     elif "Seleccione una de las siguientes citas disponibles" in resp_text:
         logging.info("[Step 4/6] Cita attempt -> selection hit!")
+        notify("Step 4/6: appointment slots on screen!", driver, urgent=True)
         if context.save_artifacts:
             driver.save_screenshot(f"citas-{dt.now()}.png".replace(":", "-"))
 
@@ -951,6 +996,7 @@ def cita_selection(driver: webdriver, context: CustomerProfile):
 
     if "Debe confirmar los datos de la cita asignada" in resp_text:
         logging.info("[Step 5/6] Cita attempt -> confirmation hit!")
+        notify("Step 5/6: slot reserved, confirming", driver, urgent=True)
         if context.current_solver == recaptchaV3Proxyless:
             context.recaptcha_solver.report_correct_recaptcha()
 
@@ -962,12 +1008,17 @@ def cita_selection(driver: webdriver, context: CustomerProfile):
             pass
 
         if context.sms_webhook_token:
+            code = None
             if sms_verification:
                 code = get_code(context)
                 if code:
                     logging.info(f"Received code: {code}")
+                    notify("SMS code received, entering it")
                     sms_verification = driver.find_element(By.ID, "txtCodigoVerificacion")
                     sms_verification.send_keys(code)
+
+            if sms_verification and not code:
+                notify("No SMS code arrived in time, the booking will fail", driver, urgent=True)
 
             confirm_appointment(driver, context)
 
@@ -976,7 +1027,7 @@ def cita_selection(driver: webdriver, context: CustomerProfile):
 
             if context.bot_result:
                 driver.quit()
-                os._exit(0)
+                return True
             return None
         else:
             if not sms_verification:
@@ -991,6 +1042,7 @@ def cita_selection(driver: webdriver, context: CustomerProfile):
 
     else:
         logging.info("[Step 5/6] Cita attempt -> missed confirmation")
+        notify("Step 5/6: slot was lost before confirmation", driver)
         if context.current_solver == recaptchaV3Proxyless:
             context.recaptcha_solver.report_incorrect_recaptcha()
         elif context.current_solver == imagecaptcha:
