@@ -4,6 +4,7 @@ import logging
 import os
 import random
 import re
+import socket
 import sys
 import tempfile
 import time
@@ -13,13 +14,14 @@ from datetime import datetime as dt
 from enum import Enum
 from json.decoder import JSONDecodeError
 from typing import Any, Dict, Optional
+from urllib.parse import urlparse
 
 import backoff
 import requests
 from anticaptchaofficial.imagecaptcha import imagecaptcha
 from anticaptchaofficial.recaptchav3proxyless import recaptchaV3Proxyless
 from selenium import webdriver
-from selenium.common.exceptions import TimeoutException
+from selenium.common.exceptions import TimeoutException, WebDriverException
 from selenium.webdriver.common.by import By
 from selenium.webdriver.common.keys import Keys
 from selenium.webdriver.support import expected_conditions as EC
@@ -220,6 +222,8 @@ def init_wedriver(context: CustomerProfile):
     options.add_argument("--ignore-certificate-errors")
     options.add_argument("--ignore-ssl-errors")
     options.add_argument("--disable-gpu")
+    if os.environ.get("PROXY_SERVER"):  # e.g. socks5://host:1080 (Chrome can't send proxy auth)
+        options.add_argument(f"--proxy-server={os.environ['PROXY_SERVER']}")
     if os.environ.get("CHROME_BIN"):  # container: headless Chromium
         options.binary_location = os.environ["CHROME_BIN"]
         for a in ("--headless=new", "--no-sandbox", "--disable-dev-shm-usage"):
@@ -307,7 +311,8 @@ def start_with(driver: webdriver, context: CustomerProfile, cycles: int = CYCLES
             logging.error("Timeout exception")
         except Exception as e:
             context.errors += 1
-            logging.error(f"SMTH BROKEN: {e}")
+            logging.error(f"SMTH BROKEN: {type(e).__name__}: {str(e).splitlines()[0]}")
+            logging.debug("Full traceback", exc_info=True)
             if not browser_alive(driver):
                 notify("Browser died, restarting the session", urgent=True)
                 break
@@ -739,12 +744,21 @@ def office_selection(driver: webdriver, context: CustomerProfile):
             btn.send_keys(Keys.ENTER)
             return True
         elif "En este momento no hay citas disponibles" in resp_text:
+            logging.info(
+                f"[Step 2/6] No appointments available (check {i + 1}/{REFRESH_PAGE_CYCLES}), "
+                "refreshing in 5s"
+            )
             time.sleep(5)
             driver.refresh()
             continue
         else:
-            logging.info("[Step 2/6] Office selection -> No offices")
+            logging.info(
+                f"[Step 2/6] Office selection -> No offices, url={driver.current_url} "
+                f"text={snippet(resp_text)!r}"
+            )
             return None
+
+    logging.info(f"[Step 2/6] Still no appointments after {REFRESH_PAGE_CYCLES} checks")
 
 
 def phone_mail(driver: webdriver, context: CustomerProfile):
@@ -813,6 +827,54 @@ def confirm_appointment(driver: webdriver, context: CustomerProfile):
     return None
 
 
+def snippet(text, n=200):
+    return " ".join(text.split())[:n]
+
+
+def probe_site(url):
+    """DNS + TCP check, so a blocked site shows up in seconds instead of a 5 minute page load."""
+    host = urlparse(url).hostname
+    started = time.monotonic()
+    try:
+        ip = socket.gethostbyname(host)
+        logging.info(f"[net] DNS {host} -> {ip} ({time.monotonic() - started:.1f}s)")
+    except OSError as e:
+        logging.error(f"[net] DNS lookup for {host} failed: {e}")
+        return False
+
+    started = time.monotonic()
+    try:
+        socket.create_connection((ip, 443), timeout=10).close()
+        logging.info(f"[net] TCP {ip}:443 connected in {time.monotonic() - started:.1f}s")
+        return True
+    except OSError as e:
+        logging.error(
+            f"[net] TCP {ip}:443 failed after {time.monotonic() - started:.1f}s: {e}. "
+            "The site drops connections from IPs outside Spain and from many datacenters: "
+            "run from a Spanish IP or set PROXY_SERVER"
+        )
+        return False
+
+
+def load(driver: webdriver, url):
+    started = time.monotonic()
+    logging.info(f"[page] GET {url}")
+    try:
+        driver.get(url)
+    except TimeoutException:
+        logging.error(f"[page] load timed out after {time.monotonic() - started:.0f}s")
+        raise
+    except WebDriverException as e:
+        if "net::ERR_" not in str(e):
+            raise
+        logging.error(f"[page] browser could not load the page: {str(e).splitlines()[0]}")
+        raise TimeoutException(str(e)) from e
+    logging.info(
+        f"[page] loaded in {time.monotonic() - started:.1f}s, url={driver.current_url} "
+        f"title={driver.title!r}"
+    )
+
+
 def log_backoff(details):
     msg = f"Unable to load the initial page, backing off {details['wait']:0.1f} seconds"
     logging.error(msg)
@@ -828,13 +890,17 @@ def log_backoff(details):
     logger=None,
 )
 def initial_page(driver: webdriver, context: CustomerProfile, fast_forward_url, fast_forward_url2):
+    if not os.environ.get("PROXY_SERVER") and not probe_site(fast_forward_url):
+        raise TimeoutException
+
     if context.first_load:
+        logging.info("[page] first load: clearing cookies and storage")
         driver.delete_all_cookies()
 
     driver.set_page_load_timeout(300 if context.first_load else 50)
     # Fix chromedriver 103 bug
     time.sleep(1)
-    driver.get(fast_forward_url)
+    load(driver, fast_forward_url)
     time.sleep(5)
     if context.first_load:
         try:
@@ -843,14 +909,19 @@ def initial_page(driver: webdriver, context: CustomerProfile, fast_forward_url, 
         except Exception as e:
             logging.error(e)
             pass
-    driver.get(fast_forward_url2)
+    load(driver, fast_forward_url2)
     time.sleep(5)
 
     resp_text = body_text(driver)
     if "INTERNET CITA PREVIA" not in resp_text:
+        logging.error(
+            f"[page] not the expected page (no 'INTERNET CITA PREVIA'), url={driver.current_url} "
+            f"text={snippet(resp_text)!r}"
+        )
         context.first_load = True
         raise TimeoutException
 
+    logging.info("[page] initial page OK")
     context.first_load = False
 
 
@@ -861,8 +932,13 @@ def cycle_cita(driver: webdriver, context: CustomerProfile, fast_forward_url, fa
     try:
         WebDriverWait(driver, DELAY).until(EC.presence_of_element_located((By.ID, "btnEntrar")))
     except TimeoutException:
-        logging.error("Timed out waiting for Instructions page to load")
+        logging.error(
+            f"Timed out waiting for Instructions page, url={driver.current_url} "
+            f"text={snippet(body_text(driver))!r}"
+        )
         return None
+
+    logging.info("[Step 0/6] Instructions page loaded")
 
     if os.environ.get("CITA_TEST") and context.operation_code == OperationType.TOMA_HUELLAS:
         logging.info("Instructions page loaded")
@@ -896,6 +972,7 @@ def cycle_cita(driver: webdriver, context: CustomerProfile, fast_forward_url, fa
         success = asignacion_nie_step2(driver, context)
 
     if not success:
+        logging.error(f"[Step 1/6] Personal info form failed, url={driver.current_url}")
         return None
 
     time.sleep(2)
@@ -903,6 +980,7 @@ def cycle_cita(driver: webdriver, context: CustomerProfile, fast_forward_url, fa
 
     try:
         WebDriverWait(driver, 7).until(EC.presence_of_element_located((By.ID, "btnConsultar")))
+        logging.info("[Step 1/6] Personal info submitted, Solicitar page loaded")
     except TimeoutException:
         logging.error("Timed out waiting for Solicitar page to load")
 
@@ -915,6 +993,7 @@ def cycle_cita(driver: webdriver, context: CustomerProfile, fast_forward_url, fa
     # 3. Solicitar cita:
     selection_result = office_selection(driver, context)
     if selection_result is None:
+        logging.info("[Step 2/6] Ended without an office selection (no appointments)")
         return None
 
     # 4. Contact info:
