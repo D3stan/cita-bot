@@ -26,7 +26,7 @@ from selenium.webdriver.support import expected_conditions as EC
 from selenium.webdriver.support.ui import Select
 from selenium.webdriver.support.wait import WebDriverWait
 
-from .notify import notify
+from .notify import THROTTLE, notify
 from .speaker import new_speaker
 
 __all__ = [
@@ -188,11 +188,13 @@ class CustomerProfile:
     wait_exact_time: Optional[list] = None  # [[minute, second]]
     reason_or_type: str = "solicitud de asilo"
 
+    alert_only: bool = False  # only report availability on Discord, never book
     heartbeat_cycles: int = 0  # post a status line to Discord every N attempts (0 = never)
 
     # Internals
     attempts: int = 0
     errors: int = 0
+    last_alert: float = -THROTTLE
     bot_result: bool = False
     first_load: Optional[bool] = True  # Wait more on the first load to cache stuff
     log_settings: Optional[dict] = field(default_factory=lambda: {"stream": sys.stdout})
@@ -714,6 +716,16 @@ def office_selection(driver: webdriver, context: CustomerProfile):
                 )
             except TimeoutException:
                 logging.error("Timed out waiting for offices to load")
+                return None
+
+            if context.alert_only:
+                if time.monotonic() - context.last_alert >= THROTTLE:
+                    context.last_alert = time.monotonic()
+                    notify(
+                        "Appointments look AVAILABLE right now (alert-only mode, not booking)",
+                        driver,
+                        urgent=True,
+                    )
                 return None
 
             notify("Step 2/6: offices have slots, selecting an office")

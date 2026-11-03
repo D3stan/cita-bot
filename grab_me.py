@@ -10,6 +10,10 @@ from bcncita.notify import notify
 e = os.environ
 
 
+def placeholder(name):
+    return e.get(name, "").strip().upper() in ("", "CHANGE_ME")
+
+
 def csv(name):
     return [v.strip() for v in e.get(name, "").split(",") if v.strip()]
 
@@ -17,12 +21,21 @@ def csv(name):
 if __name__ == "__main__":
     logging.basicConfig(format="%(asctime)s - %(message)s", level=logging.INFO, stream=sys.stdout)
 
+    if "CHANGE_ME" in e.get("DISCORD_WEBHOOK_URL", "").upper():
+        del os.environ["DISCORD_WEBHOOK_URL"]
+
+    # No anti-captcha key: only watch for availability and alert, never book.
+    alert_only = placeholder("ANTICAPTCHA_API_KEY")
+    if not alert_only and placeholder("SMS_WEBHOOK_TOKEN"):
+        # Without it the bot would block on input() waiting for a human.
+        sys.exit("SMS_WEBHOOK_TOKEN is required when ANTICAPTCHA_API_KEY is set")
+
     customer = CustomerProfile(
-        # Required: without them the bot would block on input() waiting for a human.
-        anticaptcha_api_key=e["ANTICAPTCHA_API_KEY"],
-        auto_captcha=True,
+        alert_only=alert_only,
+        anticaptcha_api_key=None if alert_only else e["ANTICAPTCHA_API_KEY"],
+        auto_captcha=not alert_only,
         auto_office=True,
-        sms_webhook_token=e["SMS_WEBHOOK_TOKEN"],
+        sms_webhook_token=None if alert_only else e["SMS_WEBHOOK_TOKEN"],
         chrome_driver_path="/usr/bin/chromedriver",
         province=Province[e.get("PROVINCE", "BARCELONA")],
         operation_code=OperationType[e.get("OPERATION", "TOMA_HUELLAS")],
@@ -46,8 +59,11 @@ if __name__ == "__main__":
 
     if not e.get("DISCORD_WEBHOOK_URL"):
         logging.warning("DISCORD_WEBHOOK_URL is not set: no Discord notifications")
+    if alert_only:
+        logging.warning("ANTICAPTCHA_API_KEY not set: ALERT-ONLY mode, nothing will be booked")
     notify(
-        f"cita-bot started: {customer.province.name} / {customer.operation_code.name}, "
+        f"cita-bot started in {'ALERT-ONLY' if alert_only else 'AUTOBOOK'} mode: "
+        f"{customer.province.name} / {customer.operation_code.name}, "
         f"offices={[o.name for o in customer.offices] or 'any'}, "
         f"dates {customer.min_date or '*'}..{customer.max_date or '*'}"
     )
