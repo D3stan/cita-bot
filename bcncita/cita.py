@@ -215,6 +215,10 @@ def init_wedriver(context: CustomerProfile):
     options.add_argument("--ignore-certificate-errors")
     options.add_argument("--ignore-ssl-errors")
     options.add_argument("--disable-gpu")
+    if os.environ.get("CHROME_BIN"):  # container: headless Chromium
+        options.binary_location = os.environ["CHROME_BIN"]
+        for a in ("--headless=new", "--no-sandbox", "--disable-dev-shm-usage"):
+            options.add_argument(a)
 
     settings = {
         "recentDestinations": [{"id": "Save as PDF", "origin": "local", "account": ""}],
